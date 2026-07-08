@@ -1,0 +1,5 @@
+# Artefatos de build local (baixados/gerados pelo CI)
+rook-agent.exe
+rook-agent-win.exe
+rook-agent-mac
+Output/

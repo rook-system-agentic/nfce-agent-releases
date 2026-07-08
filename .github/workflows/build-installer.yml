@@ -1,0 +1,57 @@
+name: Build Installer (Windows)
+
+# Compila o instalador gráfico do Agente de Captação (Inno Setup) num runner
+# Windows e sobe o RookAgentSetup.exe como artefato. Não assina (a assinatura
+# de código é trilha paralela — certificado do PO). Roda no PR (para provar que
+# compila) e sob demanda.
+on:
+  push:
+    branches: ['**']
+    paths:
+      - 'installer/**'
+      - '.github/workflows/build-installer.yml'
+  pull_request:
+    paths:
+      - 'installer/**'
+      - '.github/workflows/build-installer.yml'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release que contém o rook-agent-win.exe'
+        required: true
+        default: 'nfce-agent-v1.2.0'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Baixar o rook-agent-win.exe do release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.event.inputs.release_tag }}"
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "nfce-agent-v1.2.0" }
+          gh release download $tag -R "${{ github.repository }}" -p "rook-agent-win.exe" -D installer
+          Copy-Item "installer/rook-agent-win.exe" "installer/rook-agent.exe" -Force
+
+      - name: Instalar o Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Compilar o instalador
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\rook-agent-setup.iss"
+
+      - name: Publicar o artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: RookAgentSetup
+          path: installer/Output/RookAgentSetup.exe
+          if-no-files-found: error
