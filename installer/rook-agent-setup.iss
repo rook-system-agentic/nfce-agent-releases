@@ -246,13 +246,17 @@ begin
   batPath := ExpandConstant('{app}') + '\run-check.cmd';
   resultFile := ExpandConstant('{app}') + '\check-result.tmp';
   DeleteFile(resultFile);
+  DeleteFile(resultFile + '.part');
 
   // %~dp0 (pasta do próprio .cmd) em vez de caminho literal: usuário Windows
   // com acento no nome (ex. João) quebraria o batch ANSI por codepage OEM.
+  // Escreve em .part e renomeia (move = atômico): a leitura nunca pega
+  // arquivo escrito pela metade.
   bat :=
     '@echo off' + #13#10 +
     '"%~dp0{#ExeName}" --check >nul 2>&1' + #13#10 +
-    'echo %ERRORLEVEL%>"%~dp0check-result.tmp"' + #13#10;
+    'echo %ERRORLEVEL%>"%~dp0check-result.tmp.part"' + #13#10 +
+    'move /Y "%~dp0check-result.tmp.part" "%~dp0check-result.tmp" >nul' + #13#10;
   SaveStringToFile(batPath, bat, False);
 
   if not Exec(ExpandConstant('{cmd}'), '/S /C ""' + batPath + '""', ExpandConstant('{app}'), SW_HIDE, ewNoWait, rc) then
@@ -266,7 +270,10 @@ begin
   end;
 
   // Espera até 45s (o --check tem timeout interno de rede de 30s).
-  rc := -1;
+  // Break por "conteúdo lido", NÃO pelo sinal do valor: crash do agente vira
+  // ERRORLEVEL NEGATIVO (NTSTATUS, ex. -1073741819) e precisa quebrar o loop
+  // na hora — não esperar os 45s e virar falso "timeout".
+  rc := -999999;
   for i := 1 to 90 do
   begin
     if FileExists(resultFile) then
@@ -274,9 +281,11 @@ begin
       if LoadStringsFromFile(resultFile, lines) and (GetArrayLength(lines) > 0) then
       begin
         s := Trim(lines[0]);
-        rc := StrToIntDef(s, -1);
-        if rc >= 0 then
+        if s <> '' then
+        begin
+          rc := StrToIntDef(s, -999999);
           break;
+        end;
       end;
     end;
     Sleep(500);
@@ -284,10 +293,15 @@ begin
   DeleteFile(batPath);
   DeleteFile(resultFile);
 
-  if rc < 0 then
+  if rc = -999999 then
   begin
-    // Timeout: mata um possível processo preso e reporta com clareza.
+    // Timeout ou resultado ilegível: mata um possível processo preso e reporta.
     Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#ExeName}', '', SW_HIDE, ewWaitUntilTerminated, killRc);
+    // O cmd desbloqueado pelo kill ainda pode gravar o resultado atrasado.
+    Sleep(500);
+    DeleteFile(batPath);
+    DeleteFile(resultFile);
+    DeleteFile(resultFile + '.part');
     CheckOk := False;
     CheckResultMsg :=
       'A verificação não terminou no tempo esperado (45s). O agente pode estar bloqueado ou a rede muito lenta. ' +
@@ -302,6 +316,18 @@ begin
     CheckResultMsg :=
       'O executável do agente NÃO pôde ser iniciado. Provável bloqueio do antivírus — ' +
       'abra o Windows Defender (Histórico de proteção / quarentena), restaure/permita o rook-agent.exe e reinstale.';
+    Exit;
+  end;
+
+  // Exit code negativo = o agente ABRIU e crashou (NTSTATUS) — quase sempre
+  // interferência de antivírus/DLL bloqueada, não problema de config/rede.
+  if rc < 0 then
+  begin
+    CheckOk := False;
+    CheckResultMsg :=
+      'O agente iniciou mas travou logo em seguida (código ' + IntToStr(rc) + '). ' +
+      'Provável interferência do antivírus — verifique o Histórico de proteção do Windows Defender ' +
+      'e o log em %LOCALAPPDATA%\Rook Agent\rook-agent.log.';
     Exit;
   end;
 
@@ -335,9 +361,13 @@ begin
     end;
     5:
     begin
+      // Ambíguo de propósito: 5 pode ser o exit "sem config" do agente OU o
+      // ERRORLEVEL 5 do cmd para "acesso negado" (antivírus barrando o exe).
       CheckOk := False;
       CheckResultMsg :=
-        'A configuração do agente não foi encontrada. Rode o instalador novamente escolhendo "Reconfigurar".';
+        'A configuração do agente não foi encontrada — rode o instalador novamente escolhendo "Reconfigurar". ' +
+        'Se você acabou de configurar, também pode ser o antivírus bloqueando a execução (acesso negado) — ' +
+        'verifique o Histórico de proteção do Windows Defender.';
     end;
   else
     begin
