@@ -229,14 +229,74 @@ end;
 // Roda `rook-agent.exe --check` (valida config, pasta, conexão e token no
 // servidor) e traduz o código de saída em mensagem para a tela final.
 // Códigos: 0=ok · 2=token inválido · 3=sem conexão · 4=pasta inacessível · 5=sem config.
+//
+// O check roda DESACOPLADO (batch + ewNoWait) com prazo máximo de 45s no lado
+// do instalador: se o agente algum dia travar sem sair, o instalador NÃO
+// congela junto (lição do incidente ROO-294 — processo vivo-mas-preso sem
+// timeout vira tela congelada sem diagnóstico). O batch grava o código de
+// saída num arquivo; %ERRORLEVEL% numa linha própria de um ARQUIVO .cmd
+// expande na execução (inline com `&` expandiria antes de rodar o exe).
 procedure RunPostInstallCheck();
 var
-  exePath: String;
-  rc: Integer;
+  exePath, batPath, resultFile, bat, s: String;
+  i, rc, killRc: Integer;
+  lines: TArrayOfString;
 begin
   exePath := ExpandConstant('{app}') + '\{#ExeName}';
+  batPath := ExpandConstant('{app}') + '\run-check.cmd';
+  resultFile := ExpandConstant('{app}') + '\check-result.tmp';
+  DeleteFile(resultFile);
 
-  if not Exec(exePath, '--check', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, rc) then
+  // %~dp0 (pasta do próprio .cmd) em vez de caminho literal: usuário Windows
+  // com acento no nome (ex. João) quebraria o batch ANSI por codepage OEM.
+  bat :=
+    '@echo off' + #13#10 +
+    '"%~dp0{#ExeName}" --check >nul 2>&1' + #13#10 +
+    'echo %ERRORLEVEL%>"%~dp0check-result.tmp"' + #13#10;
+  SaveStringToFile(batPath, bat, False);
+
+  if not Exec(ExpandConstant('{cmd}'), '/S /C ""' + batPath + '""', ExpandConstant('{app}'), SW_HIDE, ewNoWait, rc) then
+  begin
+    DeleteFile(batPath);
+    CheckOk := False;
+    CheckResultMsg :=
+      'Não foi possível executar a verificação pós-instalação. ' +
+      'Consulte o log em %LOCALAPPDATA%\Rook Agent\rook-agent.log.';
+    Exit;
+  end;
+
+  // Espera até 45s (o --check tem timeout interno de rede de 30s).
+  rc := -1;
+  for i := 1 to 90 do
+  begin
+    if FileExists(resultFile) then
+    begin
+      if LoadStringsFromFile(resultFile, lines) and (GetArrayLength(lines) > 0) then
+      begin
+        s := Trim(lines[0]);
+        rc := StrToIntDef(s, -1);
+        if rc >= 0 then
+          break;
+      end;
+    end;
+    Sleep(500);
+  end;
+  DeleteFile(batPath);
+  DeleteFile(resultFile);
+
+  if rc < 0 then
+  begin
+    // Timeout: mata um possível processo preso e reporta com clareza.
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#ExeName}', '', SW_HIDE, ewWaitUntilTerminated, killRc);
+    CheckOk := False;
+    CheckResultMsg :=
+      'A verificação não terminou no tempo esperado (45s). O agente pode estar bloqueado ou a rede muito lenta. ' +
+      'Consulte o log em %LOCALAPPDATA%\Rook Agent\rook-agent.log e, se o arquivo não existir, verifique a quarentena do antivírus.';
+    Exit;
+  end;
+
+  // 9009 = cmd não achou o exe (típico de quarentena de antivírus).
+  if (rc = 9009) or (not FileExists(exePath)) then
   begin
     CheckOk := False;
     CheckResultMsg :=
