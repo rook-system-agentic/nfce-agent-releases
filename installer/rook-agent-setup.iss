@@ -1,5 +1,5 @@
 ; ============================================================
-; Rook — Agente de Captação (NFC-e) — Instalador gráfico (ROO-243)
+; Rook — Agente de Captação (NFC-e) — Instalador gráfico (ROO-243 + ROO-279)
 ; ============================================================
 ; Substitui o fluxo antigo (PowerShell como admin + assistente no CMD) por
 ; um instalador com janela: "avançar → avançar → concluir".
@@ -12,13 +12,24 @@
 ;     ESCONDIDO (sem janela preta) a cada login.
 ;   - Inicia o agente ao concluir, também escondido.
 ;
+; ROO-279 acrescenta:
+;   - Reinstalação consciente: se já existe config na máquina, o assistente
+;     mostra isso e oferece MANTER o token/pasta atuais (evita revogar token
+;     à toa e reconfigurar às cegas).
+;   - Encerra um rook-agent.exe em execução antes de copiar os arquivos
+;     (evita arquivo-em-uso e processo duplicado).
+;   - Verificação pós-instalação: roda `rook-agent.exe --check` (valida config,
+;     pasta, conexão e token no servidor) e mostra o RESULTADO REAL na tela
+;     final — "conectado ao Rook" ou o motivo exato da falha. Se o executável
+;     nem abrir, aponta para provável bloqueio de antivírus.
+;
 ; Compilado pelo CI (.github/workflows/build-installer.yml) num runner Windows.
 ; Runtime (fluxo do leigo) deve ser validado num Windows real — não dá pra
 ; testar a execução do .exe no CI (só a compilação).
 ; ============================================================
 
 #define AppName "Rook - Agente de Captação"
-#define AppVersion "1.2.0"
+#define AppVersion "1.2.1"
 #define AppPublisher "Rook System"
 #define ExeName "rook-agent.exe"
 
@@ -53,8 +64,25 @@ Filename: "{app}\{#ExeName}"; Flags: nowait runhidden skipifsilent
 
 [Code]
 var
+  ReinstallPage: TInputOptionWizardPage;
   TokenPage: TInputQueryWizardPage;
   FolderPage: TInputDirWizardPage;
+  PrevConfigExists: Boolean;
+  KeepConfig: Boolean;
+  CheckOk: Boolean;
+  CheckResultMsg: String;
+
+function ConfigFilePath(): String;
+begin
+  Result := ExpandConstant('{localappdata}\Rook Agent\.rook-agent.json');
+end;
+
+// O agente antigo (pré-instalador) gravava a config na home do usuário;
+// o agente migra sozinho, então também conta como "já instalado".
+function LegacyConfigFilePath(): String;
+begin
+  Result := ExpandConstant('{%USERPROFILE}\.rook-agent.json');
+end;
 
 // Autodetecção das pastas de XML dos PDVs mais comuns.
 function DetectPdvFolder(): String;
@@ -80,7 +108,24 @@ end;
 
 procedure InitializeWizard();
 begin
-  TokenPage := CreateInputQueryPage(wpWelcome,
+  PrevConfigExists := FileExists(ConfigFilePath()) or FileExists(LegacyConfigFilePath());
+  KeepConfig := False;
+  CheckOk := False;
+  CheckResultMsg := '';
+
+  // Página de reinstalação: só aparece quando já existe config na máquina.
+  ReinstallPage := CreateInputOptionPage(wpWelcome,
+    'Agente já instalado nesta máquina',
+    'Encontramos uma configuração anterior do Agente de Captação',
+    'Este computador já tem o agente configurado (token e pasta de XMLs). ' +
+    'Se você está apenas reinstalando ou atualizando o programa, mantenha a configuração atual — ' +
+    'NÃO é preciso gerar um novo token no Rook. Escolha uma opção:',
+    True, False);
+  ReinstallPage.Add('Manter a configuração atual (recomendado) — só reinstala o programa');
+  ReinstallPage.Add('Reconfigurar — informar um novo token e a pasta de XMLs');
+  ReinstallPage.Values[0] := True;
+
+  TokenPage := CreateInputQueryPage(ReinstallPage.ID,
     'Token do agente',
     'Cole o token gerado no Rook',
     'No Rook, acesse Central de Dados → Fontes → Agente de Captação e clique em "Gerar Token do Agente". Copie o token (começa com rk_agent_) e cole abaixo.');
@@ -95,6 +140,15 @@ begin
   FolderPage.Values[0] := DetectPdvFolder();
 end;
 
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  if (PageID = ReinstallPage.ID) and (not PrevConfigExists) then
+    Result := True;
+  if ((PageID = TokenPage.ID) or (PageID = FolderPage.ID)) and KeepConfig then
+    Result := True;
+end;
+
 // Validação de cada passo antes de avançar.
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
@@ -102,7 +156,11 @@ var
 begin
   Result := True;
 
-  if CurPageID = TokenPage.ID then
+  if CurPageID = ReinstallPage.ID then
+  begin
+    KeepConfig := ReinstallPage.Values[0];
+  end
+  else if CurPageID = TokenPage.ID then
   begin
     token := Trim(TokenPage.Values[0]);
     if Pos('rk_agent_', token) <> 1 then
@@ -126,6 +184,18 @@ begin
   end;
 end;
 
+// Encerra um agente em execução antes de copiar arquivos: evita
+// "arquivo em uso" na troca do .exe e processo duplicado depois.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  rc: Integer;
+begin
+  Result := '';
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#ExeName}', '', SW_HIDE, ewWaitUntilTerminated, rc);
+  // Pequena pausa para o Windows liberar o lock do executável.
+  Sleep(800);
+end;
+
 // Escreve a config que o agente lê + registra a inicialização automática oculta.
 procedure WriteConfigAndAutostart();
 var
@@ -134,15 +204,20 @@ begin
   appDir := ExpandConstant('{app}');
   exePath := appDir + '\{#ExeName}';
 
-  jsonFolder := FolderPage.Values[0];
-  StringChangeEx(jsonFolder, '\', '\\', True);
+  // Em reinstalação com "manter configuração", NÃO sobrescreve a config —
+  // o token atual continua valendo.
+  if not KeepConfig then
+  begin
+    jsonFolder := FolderPage.Values[0];
+    StringChangeEx(jsonFolder, '\', '\\', True);
 
-  cfg :=
-    '{' + #13#10 +
-    '  "token": "' + Trim(TokenPage.Values[0]) + '",' + #13#10 +
-    '  "folder": "' + jsonFolder + '"' + #13#10 +
-    '}' + #13#10;
-  SaveStringToFile(appDir + '\.rook-agent.json', cfg, False);
+    cfg :=
+      '{' + #13#10 +
+      '  "token": "' + Trim(TokenPage.Values[0]) + '",' + #13#10 +
+      '  "folder": "' + jsonFolder + '"' + #13#10 +
+      '}' + #13#10;
+    SaveStringToFile(appDir + '\.rook-agent.json', cfg, False);
+  end;
 
   // VBS no Startup: roda o agente com janela oculta (0) e sem esperar (False).
   vbs :=
@@ -151,10 +226,181 @@ begin
   SaveStringToFile(ExpandConstant('{userstartup}') + '\Rook Agent.vbs', vbs, False);
 end;
 
+// Roda `rook-agent.exe --check` (valida config, pasta, conexão e token no
+// servidor) e traduz o código de saída em mensagem para a tela final.
+// Códigos: 0=ok · 2=token inválido · 3=sem conexão · 4=pasta inacessível · 5=sem config.
+//
+// O check roda DESACOPLADO (batch + ewNoWait) com prazo máximo de 45s no lado
+// do instalador: se o agente algum dia travar sem sair, o instalador NÃO
+// congela junto (lição do incidente ROO-294 — processo vivo-mas-preso sem
+// timeout vira tela congelada sem diagnóstico). O batch grava o código de
+// saída num arquivo; %ERRORLEVEL% numa linha própria de um ARQUIVO .cmd
+// expande na execução (inline com `&` expandiria antes de rodar o exe).
+procedure RunPostInstallCheck();
+var
+  exePath, batPath, resultFile, bat, s: String;
+  i, rc, killRc: Integer;
+  lines: TArrayOfString;
+begin
+  exePath := ExpandConstant('{app}') + '\{#ExeName}';
+  batPath := ExpandConstant('{app}') + '\run-check.cmd';
+  resultFile := ExpandConstant('{app}') + '\check-result.tmp';
+  DeleteFile(resultFile);
+  DeleteFile(resultFile + '.part');
+
+  // %~dp0 (pasta do próprio .cmd) em vez de caminho literal: usuário Windows
+  // com acento no nome (ex. João) quebraria o batch ANSI por codepage OEM.
+  // Escreve em .part e renomeia (move = atômico): a leitura nunca pega
+  // arquivo escrito pela metade.
+  bat :=
+    '@echo off' + #13#10 +
+    '"%~dp0{#ExeName}" --check >nul 2>&1' + #13#10 +
+    'echo %ERRORLEVEL%>"%~dp0check-result.tmp.part"' + #13#10 +
+    'move /Y "%~dp0check-result.tmp.part" "%~dp0check-result.tmp" >nul' + #13#10;
+  SaveStringToFile(batPath, bat, False);
+
+  if not Exec(ExpandConstant('{cmd}'), '/S /C ""' + batPath + '""', ExpandConstant('{app}'), SW_HIDE, ewNoWait, rc) then
+  begin
+    DeleteFile(batPath);
+    CheckOk := False;
+    CheckResultMsg :=
+      'Não foi possível executar a verificação pós-instalação. ' +
+      'Consulte o log em %LOCALAPPDATA%\Rook Agent\rook-agent.log.';
+    Exit;
+  end;
+
+  // Espera até 45s (o --check tem timeout interno de rede de 30s).
+  // Break por "conteúdo lido", NÃO pelo sinal do valor: crash do agente vira
+  // ERRORLEVEL NEGATIVO (NTSTATUS, ex. -1073741819) e precisa quebrar o loop
+  // na hora — não esperar os 45s e virar falso "timeout".
+  rc := -999999;
+  for i := 1 to 90 do
+  begin
+    if FileExists(resultFile) then
+    begin
+      if LoadStringsFromFile(resultFile, lines) and (GetArrayLength(lines) > 0) then
+      begin
+        s := Trim(lines[0]);
+        if s <> '' then
+        begin
+          rc := StrToIntDef(s, -999999);
+          break;
+        end;
+      end;
+    end;
+    Sleep(500);
+  end;
+  DeleteFile(batPath);
+  DeleteFile(resultFile);
+
+  if rc = -999999 then
+  begin
+    // Timeout ou resultado ilegível: mata um possível processo preso e reporta.
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#ExeName}', '', SW_HIDE, ewWaitUntilTerminated, killRc);
+    // O cmd desbloqueado pelo kill ainda pode gravar o resultado atrasado.
+    Sleep(500);
+    DeleteFile(batPath);
+    DeleteFile(resultFile);
+    DeleteFile(resultFile + '.part');
+    CheckOk := False;
+    CheckResultMsg :=
+      'A verificação não terminou no tempo esperado (45s). O agente pode estar bloqueado ou a rede muito lenta. ' +
+      'Consulte o log em %LOCALAPPDATA%\Rook Agent\rook-agent.log e, se o arquivo não existir, verifique a quarentena do antivírus.';
+    Exit;
+  end;
+
+  // 9009 = cmd não achou o exe (típico de quarentena de antivírus).
+  if (rc = 9009) or (not FileExists(exePath)) then
+  begin
+    CheckOk := False;
+    CheckResultMsg :=
+      'O executável do agente NÃO pôde ser iniciado. Provável bloqueio do antivírus — ' +
+      'abra o Windows Defender (Histórico de proteção / quarentena), restaure/permita o rook-agent.exe e reinstale.';
+    Exit;
+  end;
+
+  // Exit code negativo = o agente ABRIU e crashou (NTSTATUS) — quase sempre
+  // interferência de antivírus/DLL bloqueada, não problema de config/rede.
+  if rc < 0 then
+  begin
+    CheckOk := False;
+    CheckResultMsg :=
+      'O agente iniciou mas travou logo em seguida (código ' + IntToStr(rc) + '). ' +
+      'Provável interferência do antivírus — verifique o Histórico de proteção do Windows Defender ' +
+      'e o log em %LOCALAPPDATA%\Rook Agent\rook-agent.log.';
+    Exit;
+  end;
+
+  case rc of
+    0:
+    begin
+      CheckOk := True;
+      CheckResultMsg := 'Verificação concluída: o agente CONECTOU ao Rook, o token foi aceito e a pasta de XMLs está acessível. Em instantes a Central de Dados mostrará o agente como Online.';
+    end;
+    2:
+    begin
+      CheckOk := False;
+      CheckResultMsg :=
+        'O agente abriu, mas o Rook recusou o token (inválido ou revogado). ' +
+        'Gere um novo token em Central de Dados → Agente de Captação e reinstale colando o token novo. ' +
+        'Atenção: gerar token novo desconecta instalações antigas.';
+    end;
+    3:
+    begin
+      CheckOk := False;
+      CheckResultMsg :=
+        'O agente abriu, mas NÃO conseguiu falar com app.rooksystem.com.br. ' +
+        'Verifique a internet, proxy ou firewall desta máquina e rode o instalador de novo.';
+    end;
+    4:
+    begin
+      CheckOk := False;
+      CheckResultMsg :=
+        'O agente conectou ao Rook, mas a pasta de XMLs configurada está inacessível neste momento. ' +
+        'O agente ficará tentando a cada 60 segundos (normal para pasta de rede). Confira o caminho se o problema persistir.';
+    end;
+    5:
+    begin
+      // Ambíguo de propósito: 5 pode ser o exit "sem config" do agente OU o
+      // ERRORLEVEL 5 do cmd para "acesso negado" (antivírus barrando o exe).
+      CheckOk := False;
+      CheckResultMsg :=
+        'A configuração do agente não foi encontrada — rode o instalador novamente escolhendo "Reconfigurar". ' +
+        'Se você acabou de configurar, também pode ser o antivírus bloqueando a execução (acesso negado) — ' +
+        'verifique o Histórico de proteção do Windows Defender.';
+    end;
+  else
+    begin
+      CheckOk := False;
+      CheckResultMsg :=
+        'Não foi possível confirmar o estado do agente (código ' + IntToStr(rc) + '). ' +
+        'Consulte o log em %LOCALAPPDATA%\Rook Agent\rook-agent.log.';
+    end;
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
+  begin
     WriteConfigAndAutostart();
+    RunPostInstallCheck();
+  end;
+end;
+
+// Tela final mostra o resultado REAL da verificação (não só "concluído").
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if CurPageID = wpFinished then
+  begin
+    WizardForm.FinishedLabel.Height := WizardForm.FinishedLabel.Height + ScaleY(80);
+    WizardForm.FinishedLabel.Caption :=
+      WizardForm.FinishedLabel.Caption + #13#10#13#10 + CheckResultMsg;
+    if not CheckOk then
+      MsgBox('Atenção: o agente foi instalado, mas ainda NÃO está operando.' + #13#10#13#10 +
+        CheckResultMsg + #13#10#13#10 +
+        'Log detalhado: %LOCALAPPDATA%\Rook Agent\rook-agent.log', mbError, MB_OK);
+  end;
 end;
 
 // Limpeza na desinstalação: remove o autostart (e a config).
