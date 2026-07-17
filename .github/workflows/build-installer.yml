@@ -19,7 +19,7 @@ on:
       release_tag:
         description: 'Release que contém o rook-agent-win.exe'
         required: true
-        default: 'nfce-agent-v1.2.0'
+        default: 'nfce-agent-v1.2.2'
 
 permissions:
   contents: read
@@ -37,7 +37,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ github.event.inputs.release_tag }}"
-          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "nfce-agent-v1.2.0" }
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "nfce-agent-v1.2.2" }
           gh release download $tag -R "${{ github.repository }}" -p "rook-agent-win.exe" -D installer
           Copy-Item "installer/rook-agent-win.exe" "installer/rook-agent.exe" -Force
 

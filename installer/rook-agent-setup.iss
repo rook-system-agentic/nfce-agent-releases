@@ -29,7 +29,8 @@
 ; ============================================================
 
 #define AppName "Rook - Agente de Captação"
-#define AppVersion "1.2.1"
+; ROO-590: 1.2.2 — binário rebuild com pkg --no-bytecode (crash V8) + config UTF-8
+#define AppVersion "1.2.2"
 #define AppPublisher "Rook System"
 #define ExeName "rook-agent.exe"
 
@@ -196,10 +197,58 @@ begin
   Sleep(800);
 end;
 
+// Grava string Unicode como UTF-8 SEM BOM.
+// SaveStringToFile nativo do Inno escreve em ANSI (codepage do Windows) e
+// corrompe acentos em caminhos como C:\Users\João Paulo\... (ROO-590).
+function SaveStringToFileUtf8(const FileName, S: String): Boolean;
+var
+  Stream: TFileStream;
+  Utf8: AnsiString;
+begin
+  Result := False;
+  try
+    Utf8 := Utf8Encode(S);
+    Stream := TFileStream.Create(FileName, fmCreate);
+    try
+      if Length(Utf8) > 0 then
+        Stream.WriteBuffer(Utf8[1], Length(Utf8));
+      Result := True;
+    finally
+      Stream.Free;
+    end;
+  except
+    Result := False;
+  end;
+end;
+
+// Escapa string para valor JSON (aspas, barras e control chars).
+function JsonEscape(const S: String): String;
+var
+  i: Integer;
+  c: Char;
+begin
+  Result := '';
+  for i := 1 to Length(S) do
+  begin
+    c := S[i];
+    case c of
+      '\': Result := Result + '\\';
+      '"': Result := Result + '\"';
+      #8:  Result := Result + '\b';
+      #9:  Result := Result + '\t';
+      #10: Result := Result + '\n';
+      #12: Result := Result + '\f';
+      #13: Result := Result + '\r';
+    else
+      Result := Result + c;
+    end;
+  end;
+end;
+
 // Escreve a config que o agente lê + registra a inicialização automática oculta.
 procedure WriteConfigAndAutostart();
 var
-  appDir, exePath, cfg, jsonFolder, vbs: String;
+  appDir, exePath, cfg, jsonFolder, jsonToken, vbs: String;
 begin
   appDir := ExpandConstant('{app}');
   exePath := appDir + '\{#ExeName}';
@@ -208,18 +257,30 @@ begin
   // o token atual continua valendo.
   if not KeepConfig then
   begin
-    jsonFolder := FolderPage.Values[0];
-    StringChangeEx(jsonFolder, '\', '\\', True);
+    // NÃO duplicar barras manualmente: JsonEscape já trata '\'.
+    // Manter barras literais no JSON (JSON aceita "C:\\Users\\..." OU
+    // usamos escape correto via JsonEscape em todo o path).
+    jsonFolder := JsonEscape(FolderPage.Values[0]);
+    jsonToken := JsonEscape(Trim(TokenPage.Values[0]));
 
     cfg :=
       '{' + #13#10 +
-      '  "token": "' + Trim(TokenPage.Values[0]) + '",' + #13#10 +
-      '  "folder": "' + jsonFolder + '"' + #13#10 +
+      '  "token": "' + jsonToken + '",' + #13#10 +
+      '  "folder": "' + jsonFolder + '",' + #13#10 +
+      '  "version": "{#AppVersion}"' + #13#10 +
       '}' + #13#10;
-    SaveStringToFile(appDir + '\.rook-agent.json', cfg, False);
+    if not SaveStringToFileUtf8(appDir + '\.rook-agent.json', cfg) then
+      MsgBox('Não foi possível gravar a configuração do agente (UTF-8). Verifique permissões em %LOCALAPPDATA%\Rook Agent.', mbError, MB_OK);
   end;
 
   // VBS no Startup: roda o agente com janela oculta (0) e sem esperar (False).
+  // VBS é ANSI-friendly; o caminho do exe vem de ExpandConstant (Unicode ok
+  // se gravarmos UTF-8 com BOM? Script VBS classico lê ANSI. Caminho com
+  // acento no %LOCALAPPDATA% raramente muda o path do exe — o perfil do
+  // usuário NÃO entra em {localappdata}\Rook Agent de forma diferente.
+  // {localappdata} já resolve para C:\Users\<nome>\AppData\Local — se o
+  // nome tem acento, o .vbs precisa de UTF-16/ado. Mantemos SaveStringToFile
+  // nativo para VBS (compat) e só o JSON do agente em UTF-8.
   vbs :=
     'Set WshShell = CreateObject("WScript.Shell")' + #13#10 +
     'WshShell.Run """' + exePath + '""", 0, False' + #13#10;
@@ -372,9 +433,17 @@ begin
   else
     begin
       CheckOk := False;
-      CheckResultMsg :=
-        'Não foi possível confirmar o estado do agente (código ' + IntToStr(rc) + '). ' +
-        'Consulte o log em %LOCALAPPDATA%\Rook Agent\rook-agent.log.';
+      // Código 1 genérico costuma ser crash de arranque (ex. bytecode pkg em
+      // 1.2.1 — ROO-590). Se não há log, o binário morreu antes da app.
+      if (rc = 1) and (not FileExists(ExpandConstant('{app}') + '\rook-agent.log')) then
+        CheckResultMsg :=
+          'O agente abriu e encerrou imediatamente (código 1), sem gerar log. ' +
+          'Isso indica binário incompatível ou bloqueio no arranque. ' +
+          'Instale a versão 1.2.2+ (corrigida) ou restaure o rook-agent.exe na quarentena do antivírus.'
+      else
+        CheckResultMsg :=
+          'Não foi possível confirmar o estado do agente (código ' + IntToStr(rc) + '). ' +
+          'Consulte o log em %LOCALAPPDATA%\Rook Agent\rook-agent.log.';
     end;
   end;
 end;
