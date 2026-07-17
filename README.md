@@ -22,3 +22,16 @@ Acesse a seção [Releases](https://github.com/rook-system-agentic/nfce-agent-re
 O instalador é gerado pelo Inno Setup a partir de [`installer/rook-agent-setup.iss`](installer/rook-agent-setup.iss).
 O workflow [`build-installer`](.github/workflows/build-installer.yml) compila num runner Windows e publica o `RookAgentSetup.exe` como artefato (baixa o `rook-agent-win.exe` do release informado). A assinatura de código é uma trilha à parte (certificado do PO).
 
+### Release 1.2.2 (ROO-590)
+
+1. No monorepo `rook-system`, rode o workflow **Build NFC-e Agent binaries** (gera
+   `rook-agent-win.exe` / `rook-agent-mac` com `pkg --no-bytecode`).
+2. Publique os assets no release `nfce-agent-v1.2.2` deste repositório.
+3. Dispare **Build Installer (Windows)** com `release_tag=nfce-agent-v1.2.2` e
+   anexe o `RookAgentSetup.exe` ao mesmo release.
+4. Confirme que o app Rook aponta `RELEASE_TAG=nfce-agent-v1.2.2` na rota de download.
+
+**Correções 1.2.2:**
+- Crash Windows: `[pkg] V8 rejected the bytecode cache` (binário rebuild com `--no-bytecode`).
+- Config `.rook-agent.json` gravada em UTF-8 (caminhos com acento, ex. `João Paulo`).
+
