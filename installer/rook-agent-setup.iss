@@ -222,26 +222,34 @@ begin
 end;
 
 // Escapa string para valor JSON (aspas, barras e control chars).
+// NÃO use #8 / #9 como labels de case: o preprocessor do Inno (ISPP)
+// interpreta linhas começando com # como diretiva (quebra o compile).
 function JsonEscape(const S: String): String;
 var
-  i: Integer;
+  i, code: Integer;
   c: Char;
 begin
   Result := '';
   for i := 1 to Length(S) do
   begin
     c := S[i];
-    case c of
-      '\': Result := Result + '\\';
-      '"': Result := Result + '\"';
-      #8:  Result := Result + '\b';
-      #9:  Result := Result + '\t';
-      #10: Result := Result + '\n';
-      #12: Result := Result + '\f';
-      #13: Result := Result + '\r';
+    code := Ord(c);
+    if c = '\' then
+      Result := Result + '\\'
+    else if c = '"' then
+      Result := Result + '\"'
+    else if code = 8 then
+      Result := Result + '\b'
+    else if code = 9 then
+      Result := Result + '\t'
+    else if code = 10 then
+      Result := Result + '\n'
+    else if code = 12 then
+      Result := Result + '\f'
+    else if code = 13 then
+      Result := Result + '\r'
     else
       Result := Result + c;
-    end;
   end;
 end;
 
