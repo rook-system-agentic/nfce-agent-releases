@@ -30,7 +30,11 @@
 
 #define AppName "Rook - Agente de Captação"
 ; ROO-590: 1.2.2 — binário rebuild com pkg --no-bytecode (crash V8) + config UTF-8
-#define AppVersion "1.2.2"
+; ROO-648: 1.2.3 — a config passa a ser gravada pelo PRÓPRIO agente
+;   (rook-agent.exe --configure): o helper Pascal da 1.2.2 usava
+;   WriteBuffer(Utf8[1], N) — idiom Delphi que o PascalScript não suporta
+;   (buffer temporário de 1 byte + overread) e falhava em QUALQUER máquina.
+#define AppVersion "1.2.3"
 #define AppPublisher "Rook System"
 #define ExeName "rook-agent.exe"
 
@@ -61,7 +65,8 @@ Source: "rook-agent.exe"; DestDir: "{app}"; DestName: "{#ExeName}"; Flags: ignor
 
 [Run]
 ; Inicia o agente escondido ao finalizar (sem janela de console).
-Filename: "{app}\{#ExeName}"; Flags: nowait runhidden skipifsilent
+; Check: só quando a configuração foi gravada (ou mantida) com sucesso.
+Filename: "{app}\{#ExeName}"; Flags: nowait runhidden skipifsilent; Check: ShouldRunAgentNow
 
 [Code]
 var
@@ -70,6 +75,7 @@ var
   FolderPage: TInputDirWizardPage;
   PrevConfigExists: Boolean;
   KeepConfig: Boolean;
+  ConfigOk: Boolean;
   CheckOk: Boolean;
   CheckResultMsg: String;
 
@@ -111,6 +117,12 @@ procedure InitializeWizard();
 begin
   PrevConfigExists := FileExists(ConfigFilePath()) or FileExists(LegacyConfigFilePath());
   KeepConfig := False;
+  // Instalação silenciosa não passa pelo NextButtonClick da ReinstallPage:
+  // sem isto, reinstalar /SILENT numa máquina configurada tentaria
+  // --configure com token vazio (revisão ROO-648).
+  if WizardSilent then
+    KeepConfig := PrevConfigExists;
+  ConfigOk := False;
   CheckOk := False;
   CheckResultMsg := '';
 
@@ -168,6 +180,13 @@ begin
     begin
       MsgBox('O token deve começar com rk_agent_. Gere e copie o token no Rook (Central de Dados → Fontes → Agente de Captação).', mbError, MB_OK);
       Result := False;
+    end
+    else if Pos('"', token) > 0 then
+    begin
+      // Aspa embutida (paste defeituoso) passaria pela checagem de prefixo e
+      // desmontaria a linha de comando do --configure (regras da CRT).
+      MsgBox('O token contém aspas ("), o que indica cópia incompleta. Copie o token novamente no Rook.', mbError, MB_OK);
+      Result := False;
     end;
   end
   else if CurPageID = FolderPage.ID then
@@ -175,6 +194,11 @@ begin
     if Trim(FolderPage.Values[0]) = '' then
     begin
       MsgBox('Selecione a pasta de XMLs do seu PDV.', mbError, MB_OK);
+      Result := False;
+    end
+    else if Pos('"', FolderPage.Values[0]) > 0 then
+    begin
+      MsgBox('O caminho da pasta não pode conter aspas ("). Corrija o caminho.', mbError, MB_OK);
       Result := False;
     end
     else if not DirExists(FolderPage.Values[0]) then
@@ -197,89 +221,82 @@ begin
   Sleep(800);
 end;
 
-// Grava string Unicode como UTF-8 SEM BOM.
-// SaveStringToFile nativo do Inno escreve em ANSI (codepage do Windows) e
-// corrompe acentos em caminhos como C:\Users\João Paulo\... (ROO-590).
-function SaveStringToFileUtf8(const FileName, S: String): Boolean;
+// Quota um argumento para a linha de comando Windows (regras da CRT /
+// CommandLineToArgvW): backslashes FINAIS antes da aspa de fechamento
+// precisam ser dobrados, senão `--folder "C:\pasta\"` parseia como
+// `C:\pasta"` e a aspa literal engole o resto da linha (regra 2n+1 da doc
+// Microsoft). Token e paths nunca contêm aspas — só a cauda precisa disso.
+function ArgQuote(const S: String): String;
 var
-  Stream: TFileStream;
-  Utf8: AnsiString;
+  N: Integer;
 begin
-  Result := False;
-  try
-    Utf8 := Utf8Encode(S);
-    Stream := TFileStream.Create(FileName, fmCreate);
-    try
-      if Length(Utf8) > 0 then
-        Stream.WriteBuffer(Utf8[1], Length(Utf8));
-      Result := True;
-    finally
-      Stream.Free;
-    end;
-  except
-    Result := False;
-  end;
-end;
-
-// Escapa string para valor JSON (aspas, barras e control chars).
-// NÃO use #8 / #9 como labels de case: o preprocessor do Inno (ISPP)
-// interpreta linhas começando com # como diretiva (quebra o compile).
-function JsonEscape(const S: String): String;
-var
-  i, code: Integer;
-  c: Char;
-begin
-  Result := '';
-  for i := 1 to Length(S) do
+  // Loop com break explícito: o PascalScript NÃO faz short-circuit no "and" —
+  // com S só de backslashes, o teste composto avaliaria S[0] (Out of Range).
+  N := 0;
+  while N < Length(S) do
   begin
-    c := S[i];
-    code := Ord(c);
-    if c = '\' then
-      Result := Result + '\\'
-    else if c = '"' then
-      Result := Result + '\"'
-    else if code = 8 then
-      Result := Result + '\b'
-    else if code = 9 then
-      Result := Result + '\t'
-    else if code = 10 then
-      Result := Result + '\n'
-    else if code = 12 then
-      Result := Result + '\f'
-    else if code = 13 then
-      Result := Result + '\r'
-    else
-      Result := Result + c;
+    if S[Length(S) - N] <> '\' then
+      break;
+    N := N + 1;
   end;
+  Result := '"' + S + StringOfChar('\', N) + '"';
 end;
 
-// Escreve a config que o agente lê + registra a inicialização automática oculta.
+// Gate do [Run]: iniciar o agente só faz sentido com config gravada/mantida.
+function ShouldRunAgentNow(): Boolean;
+begin
+  Result := ConfigOk;
+end;
+
+// Grava a config DELEGANDO ao próprio agente (ROO-648) + registra a
+// inicialização automática oculta.
+//
+// Por que delegar: o agente Node já grava .rook-agent.json certo (UTF-8 sem
+// BOM) há várias versões, com acento no perfil ou sem; era a rotina Pascal
+// daqui que corrompia (1.2.1: ANSI → mojibake; 1.2.2: WriteBuffer com idiom
+// Delphi → falha sempre). O --configure também é ATÔMICO (tmp+rename): falha
+// no meio não destrói config anterior (ROO-649). Exec usa CreateProcessW e o
+// exe Node lê GetCommandLineW — parâmetros Unicode chegam intactos fim a fim.
 procedure WriteConfigAndAutostart();
 var
-  appDir, exePath, cfg, jsonFolder, jsonToken, vbs: String;
+  appDir, exePath, params, vbs: String;
+  rc: Integer;
 begin
   appDir := ExpandConstant('{app}');
   exePath := appDir + '\{#ExeName}';
 
-  // Em reinstalação com "manter configuração", NÃO sobrescreve a config —
-  // o token atual continua valendo.
+  // Em reinstalação com "manter configuração", NÃO reconfigura — o token
+  // atual continua valendo.
+  ConfigOk := True;
   if not KeepConfig then
   begin
-    // NÃO duplicar barras manualmente: JsonEscape já trata '\'.
-    // Manter barras literais no JSON (JSON aceita "C:\\Users\\..." OU
-    // usamos escape correto via JsonEscape em todo o path).
-    jsonFolder := JsonEscape(FolderPage.Values[0]);
-    jsonToken := JsonEscape(Trim(TokenPage.Values[0]));
-
-    cfg :=
-      '{' + #13#10 +
-      '  "token": "' + jsonToken + '",' + #13#10 +
-      '  "folder": "' + jsonFolder + '",' + #13#10 +
-      '  "version": "{#AppVersion}"' + #13#10 +
-      '}' + #13#10;
-    if not SaveStringToFileUtf8(appDir + '\.rook-agent.json', cfg) then
-      MsgBox('Não foi possível gravar a configuração do agente (UTF-8). Verifique permissões em %LOCALAPPDATA%\Rook Agent.', mbError, MB_OK);
+    params := '--configure --token ' + ArgQuote(Trim(TokenPage.Values[0])) +
+              ' --folder ' + ArgQuote(FolderPage.Values[0]);
+    rc := 0;
+    // Dois espaços de erro distintos (revisão ROO-648): Exec=False → rc é
+    // erro Win32 (2=não achou, 5=acesso negado); Exec=True e rc<>0 → exit
+    // code do agente. Misturar os dois na mesma frase induzia o suporte a
+    // ler "código 2/5" pela tabela do --check (2=token, 5=sem config).
+    if not Exec(exePath, params, appDir, SW_HIDE, ewWaitUntilTerminated, rc) then
+    begin
+      ConfigOk := False;
+      MsgBox('O executável do agente não pôde ser INICIADO (erro do Windows ' + IntToStr(rc) + '). ' +
+        'Provável bloqueio do antivírus — restaure o rook-agent.exe na quarentena (Windows Defender → ' +
+        'Histórico de proteção) e rode o instalador novamente.', mbError, MB_OK);
+    end
+    else if rc <> 0 then
+    begin
+      ConfigOk := False;
+      MsgBox('O agente recusou a configuração (código ' + IntToStr(rc) + '). ' +
+        'Detalhes: %LOCALAPPDATA%\Rook Agent\rook-agent.log. Corrija a causa e rode o instalador novamente.', mbError, MB_OK);
+    end;
   end;
+
+  // Sem config gravada, NÃO registrar autostart nem iniciar o agente: um
+  // agente sem config lançado escondido não tem o que fazer (e pré-1.2.3
+  // travava esperando stdin invisível — um processo zumbi por login).
+  if not ConfigOk then
+    Exit;
 
   // VBS no Startup: roda o agente com janela oculta (0) e sem esperar (False).
   // VBS é ANSI-friendly; o caminho do exe vem de ExpandConstant (Unicode ok

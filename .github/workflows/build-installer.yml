@@ -19,7 +19,7 @@ on:
       release_tag:
         description: 'Release que contém o rook-agent-win.exe'
         required: true
-        default: 'nfce-agent-v1.2.2'
+        default: 'nfce-agent-v1.2.3'
 
 permissions:
   contents: read
@@ -37,9 +37,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ github.event.inputs.release_tag }}"
-          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "nfce-agent-v1.2.2" }
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "nfce-agent-v1.2.3" }
           gh release download $tag -R "${{ github.repository }}" -p "rook-agent-win.exe" -D installer
           Copy-Item "installer/rook-agent-win.exe" "installer/rook-agent.exe" -Force
+
+      # Gate ROO-648: a versão do binário baixado TEM que bater com o
+      # AppVersion do .iss. Sem isto, um dispatch com tag errada embala um
+      # agente antigo sem --configure — e o instalador congela para sempre
+      # no Exec do ssPostInstall (o smoke do build-nfce-agent não viaja
+      # até o release; este é o único ponto que vê exe e .iss juntos).
+      - name: Conferir versão do binário vs AppVersion do .iss
+        shell: pwsh
+        run: |
+          $appVersion = (Select-String -Path installer/rook-agent-setup.iss -Pattern '#define AppVersion "([^"]+)"').Matches[0].Groups[1].Value
+          $binVersion = (& installer/rook-agent.exe --version) | Out-String
+          Write-Host "AppVersion do .iss: $appVersion"
+          Write-Host "Binário respondeu: $($binVersion.Trim())"
+          if ($binVersion -notmatch [regex]::Escape($appVersion)) {
+            throw "Binário baixado NÃO é v$appVersion — tag errada ou release desatualizado. Abortando para não embalar instalador $appVersion com agente antigo."
+          }
 
       - name: Instalar o Inno Setup
         run: choco install innosetup --no-progress -y
