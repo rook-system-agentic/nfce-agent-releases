@@ -65,7 +65,8 @@ Source: "rook-agent.exe"; DestDir: "{app}"; DestName: "{#ExeName}"; Flags: ignor
 
 [Run]
 ; Inicia o agente escondido ao finalizar (sem janela de console).
-Filename: "{app}\{#ExeName}"; Flags: nowait runhidden skipifsilent
+; Check: só quando a configuração foi gravada (ou mantida) com sucesso.
+Filename: "{app}\{#ExeName}"; Flags: nowait runhidden skipifsilent; Check: ShouldRunAgentNow
 
 [Code]
 var
@@ -74,6 +75,7 @@ var
   FolderPage: TInputDirWizardPage;
   PrevConfigExists: Boolean;
   KeepConfig: Boolean;
+  ConfigOk: Boolean;
   CheckOk: Boolean;
   CheckResultMsg: String;
 
@@ -115,6 +117,12 @@ procedure InitializeWizard();
 begin
   PrevConfigExists := FileExists(ConfigFilePath()) or FileExists(LegacyConfigFilePath());
   KeepConfig := False;
+  // Instalação silenciosa não passa pelo NextButtonClick da ReinstallPage:
+  // sem isto, reinstalar /SILENT numa máquina configurada tentaria
+  // --configure com token vazio (revisão ROO-648).
+  if WizardSilent then
+    KeepConfig := PrevConfigExists;
+  ConfigOk := False;
   CheckOk := False;
   CheckResultMsg := '';
 
@@ -172,6 +180,13 @@ begin
     begin
       MsgBox('O token deve começar com rk_agent_. Gere e copie o token no Rook (Central de Dados → Fontes → Agente de Captação).', mbError, MB_OK);
       Result := False;
+    end
+    else if Pos('"', token) > 0 then
+    begin
+      // Aspa embutida (paste defeituoso) passaria pela checagem de prefixo e
+      // desmontaria a linha de comando do --configure (regras da CRT).
+      MsgBox('O token contém aspas ("), o que indica cópia incompleta. Copie o token novamente no Rook.', mbError, MB_OK);
+      Result := False;
     end;
   end
   else if CurPageID = FolderPage.ID then
@@ -179,6 +194,11 @@ begin
     if Trim(FolderPage.Values[0]) = '' then
     begin
       MsgBox('Selecione a pasta de XMLs do seu PDV.', mbError, MB_OK);
+      Result := False;
+    end
+    else if Pos('"', FolderPage.Values[0]) > 0 then
+    begin
+      MsgBox('O caminho da pasta não pode conter aspas ("). Corrija o caminho.', mbError, MB_OK);
       Result := False;
     end
     else if not DirExists(FolderPage.Values[0]) then
@@ -210,10 +230,22 @@ function ArgQuote(const S: String): String;
 var
   N: Integer;
 begin
+  // Loop com break explícito: o PascalScript NÃO faz short-circuit no "and" —
+  // com S só de backslashes, o teste composto avaliaria S[0] (Out of Range).
   N := 0;
-  while (Length(S) - N > 0) and (S[Length(S) - N] = '\') do
+  while N < Length(S) do
+  begin
+    if S[Length(S) - N] <> '\' then
+      break;
     N := N + 1;
+  end;
   Result := '"' + S + StringOfChar('\', N) + '"';
+end;
+
+// Gate do [Run]: iniciar o agente só faz sentido com config gravada/mantida.
+function ShouldRunAgentNow(): Boolean;
+begin
+  Result := ConfigOk;
 end;
 
 // Grava a config DELEGANDO ao próprio agente (ROO-648) + registra a
@@ -235,16 +267,36 @@ begin
 
   // Em reinstalação com "manter configuração", NÃO reconfigura — o token
   // atual continua valendo.
+  ConfigOk := True;
   if not KeepConfig then
   begin
     params := '--configure --token ' + ArgQuote(Trim(TokenPage.Values[0])) +
               ' --folder ' + ArgQuote(FolderPage.Values[0]);
     rc := 0;
-    if (not Exec(exePath, params, appDir, SW_HIDE, ewWaitUntilTerminated, rc)) or (rc <> 0) then
-      MsgBox('Não foi possível gravar a configuração do agente (código ' + IntToStr(rc) + '). ' +
-        'Detalhes: %LOCALAPPDATA%\Rook Agent\rook-agent.log. Se o arquivo não existir, ' +
-        'verifique a quarentena do antivírus e rode o instalador novamente.', mbError, MB_OK);
+    // Dois espaços de erro distintos (revisão ROO-648): Exec=False → rc é
+    // erro Win32 (2=não achou, 5=acesso negado); Exec=True e rc<>0 → exit
+    // code do agente. Misturar os dois na mesma frase induzia o suporte a
+    // ler "código 2/5" pela tabela do --check (2=token, 5=sem config).
+    if not Exec(exePath, params, appDir, SW_HIDE, ewWaitUntilTerminated, rc) then
+    begin
+      ConfigOk := False;
+      MsgBox('O executável do agente não pôde ser INICIADO (erro do Windows ' + IntToStr(rc) + '). ' +
+        'Provável bloqueio do antivírus — restaure o rook-agent.exe na quarentena (Windows Defender → ' +
+        'Histórico de proteção) e rode o instalador novamente.', mbError, MB_OK);
+    end
+    else if rc <> 0 then
+    begin
+      ConfigOk := False;
+      MsgBox('O agente recusou a configuração (código ' + IntToStr(rc) + '). ' +
+        'Detalhes: %LOCALAPPDATA%\Rook Agent\rook-agent.log. Corrija a causa e rode o instalador novamente.', mbError, MB_OK);
+    end;
   end;
+
+  // Sem config gravada, NÃO registrar autostart nem iniciar o agente: um
+  // agente sem config lançado escondido não tem o que fazer (e pré-1.2.3
+  // travava esperando stdin invisível — um processo zumbi por login).
+  if not ConfigOk then
+    Exit;
 
   // VBS no Startup: roda o agente com janela oculta (0) e sem esperar (False).
   // VBS é ANSI-friendly; o caminho do exe vem de ExpandConstant (Unicode ok
