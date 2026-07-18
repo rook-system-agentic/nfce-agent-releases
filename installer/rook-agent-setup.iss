@@ -30,7 +30,11 @@
 
 #define AppName "Rook - Agente de Captação"
 ; ROO-590: 1.2.2 — binário rebuild com pkg --no-bytecode (crash V8) + config UTF-8
-#define AppVersion "1.2.2"
+; ROO-648: 1.2.3 — a config passa a ser gravada pelo PRÓPRIO agente
+;   (rook-agent.exe --configure): o helper Pascal da 1.2.2 usava
+;   WriteBuffer(Utf8[1], N) — idiom Delphi que o PascalScript não suporta
+;   (buffer temporário de 1 byte + overread) e falhava em QUALQUER máquina.
+#define AppVersion "1.2.3"
 #define AppPublisher "Rook System"
 #define ExeName "rook-agent.exe"
 
@@ -197,88 +201,49 @@ begin
   Sleep(800);
 end;
 
-// Grava string Unicode como UTF-8 SEM BOM.
-// SaveStringToFile nativo do Inno escreve em ANSI (codepage do Windows) e
-// corrompe acentos em caminhos como C:\Users\João Paulo\... (ROO-590).
-function SaveStringToFileUtf8(const FileName, S: String): Boolean;
+// Quota um argumento para a linha de comando Windows (regras da CRT /
+// CommandLineToArgvW): backslashes FINAIS antes da aspa de fechamento
+// precisam ser dobrados, senão `--folder "C:\pasta\"` parseia como
+// `C:\pasta"` e a aspa literal engole o resto da linha (regra 2n+1 da doc
+// Microsoft). Token e paths nunca contêm aspas — só a cauda precisa disso.
+function ArgQuote(const S: String): String;
 var
-  Stream: TFileStream;
-  Utf8: AnsiString;
+  N: Integer;
 begin
-  Result := False;
-  try
-    Utf8 := Utf8Encode(S);
-    Stream := TFileStream.Create(FileName, fmCreate);
-    try
-      if Length(Utf8) > 0 then
-        Stream.WriteBuffer(Utf8[1], Length(Utf8));
-      Result := True;
-    finally
-      Stream.Free;
-    end;
-  except
-    Result := False;
-  end;
+  N := 0;
+  while (Length(S) - N > 0) and (S[Length(S) - N] = '\') do
+    N := N + 1;
+  Result := '"' + S + StringOfChar('\', N) + '"';
 end;
 
-// Escapa string para valor JSON (aspas, barras e control chars).
-// NÃO use #8 / #9 como labels de case: o preprocessor do Inno (ISPP)
-// interpreta linhas começando com # como diretiva (quebra o compile).
-function JsonEscape(const S: String): String;
-var
-  i, code: Integer;
-  c: Char;
-begin
-  Result := '';
-  for i := 1 to Length(S) do
-  begin
-    c := S[i];
-    code := Ord(c);
-    if c = '\' then
-      Result := Result + '\\'
-    else if c = '"' then
-      Result := Result + '\"'
-    else if code = 8 then
-      Result := Result + '\b'
-    else if code = 9 then
-      Result := Result + '\t'
-    else if code = 10 then
-      Result := Result + '\n'
-    else if code = 12 then
-      Result := Result + '\f'
-    else if code = 13 then
-      Result := Result + '\r'
-    else
-      Result := Result + c;
-  end;
-end;
-
-// Escreve a config que o agente lê + registra a inicialização automática oculta.
+// Grava a config DELEGANDO ao próprio agente (ROO-648) + registra a
+// inicialização automática oculta.
+//
+// Por que delegar: o agente Node já grava .rook-agent.json certo (UTF-8 sem
+// BOM) há várias versões, com acento no perfil ou sem; era a rotina Pascal
+// daqui que corrompia (1.2.1: ANSI → mojibake; 1.2.2: WriteBuffer com idiom
+// Delphi → falha sempre). O --configure também é ATÔMICO (tmp+rename): falha
+// no meio não destrói config anterior (ROO-649). Exec usa CreateProcessW e o
+// exe Node lê GetCommandLineW — parâmetros Unicode chegam intactos fim a fim.
 procedure WriteConfigAndAutostart();
 var
-  appDir, exePath, cfg, jsonFolder, jsonToken, vbs: String;
+  appDir, exePath, params, vbs: String;
+  rc: Integer;
 begin
   appDir := ExpandConstant('{app}');
   exePath := appDir + '\{#ExeName}';
 
-  // Em reinstalação com "manter configuração", NÃO sobrescreve a config —
-  // o token atual continua valendo.
+  // Em reinstalação com "manter configuração", NÃO reconfigura — o token
+  // atual continua valendo.
   if not KeepConfig then
   begin
-    // NÃO duplicar barras manualmente: JsonEscape já trata '\'.
-    // Manter barras literais no JSON (JSON aceita "C:\\Users\\..." OU
-    // usamos escape correto via JsonEscape em todo o path).
-    jsonFolder := JsonEscape(FolderPage.Values[0]);
-    jsonToken := JsonEscape(Trim(TokenPage.Values[0]));
-
-    cfg :=
-      '{' + #13#10 +
-      '  "token": "' + jsonToken + '",' + #13#10 +
-      '  "folder": "' + jsonFolder + '",' + #13#10 +
-      '  "version": "{#AppVersion}"' + #13#10 +
-      '}' + #13#10;
-    if not SaveStringToFileUtf8(appDir + '\.rook-agent.json', cfg) then
-      MsgBox('Não foi possível gravar a configuração do agente (UTF-8). Verifique permissões em %LOCALAPPDATA%\Rook Agent.', mbError, MB_OK);
+    params := '--configure --token ' + ArgQuote(Trim(TokenPage.Values[0])) +
+              ' --folder ' + ArgQuote(FolderPage.Values[0]);
+    rc := 0;
+    if (not Exec(exePath, params, appDir, SW_HIDE, ewWaitUntilTerminated, rc)) or (rc <> 0) then
+      MsgBox('Não foi possível gravar a configuração do agente (código ' + IntToStr(rc) + '). ' +
+        'Detalhes: %LOCALAPPDATA%\Rook Agent\rook-agent.log. Se o arquivo não existir, ' +
+        'verifique a quarentena do antivírus e rode o instalador novamente.', mbError, MB_OK);
   end;
 
   // VBS no Startup: roda o agente com janela oculta (0) e sem esperar (False).

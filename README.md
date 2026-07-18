@@ -22,6 +22,24 @@ Acesse a seção [Releases](https://github.com/rook-system-agentic/nfce-agent-re
 O instalador é gerado pelo Inno Setup a partir de [`installer/rook-agent-setup.iss`](installer/rook-agent-setup.iss).
 O workflow [`build-installer`](.github/workflows/build-installer.yml) compila num runner Windows e publica o `RookAgentSetup.exe` como artefato (baixa o `rook-agent-win.exe` do release informado). A assinatura de código é uma trilha à parte (certificado do PO).
 
+### Release 1.2.3 (ROO-648 / ROO-649)
+
+1. No monorepo `rook-system`, rode o workflow **Build NFC-e Agent binaries** com
+   `publish_release=true` e `release_tag=nfce-agent-v1.2.3` (confira que os DOIS
+   assets subiram — no 1.2.2 o `rook-agent-mac` ficou faltando e o auto-update
+   de macs respondia 502).
+2. Dispare **Build Installer (Windows)** com `release_tag=nfce-agent-v1.2.3` e
+   anexe o `RookAgentSetup.exe` ao mesmo release.
+3. Só depois dos 3 assets no release: PR no app Rook bumpando `RELEASE_TAG` e
+   `LATEST_AGENT_VERSION` JUNTOS (binários primeiro, constantes depois).
+
+**Correções 1.2.3:**
+- Instalador não grava mais o `.rook-agent.json` por conta própria: delega ao
+  `rook-agent.exe --configure --token ... --folder ...` (ROO-648). O helper
+  Pascal da 1.2.2 (`WriteBuffer(Utf8[1], N)`) falhava em qualquer máquina.
+- Gravação atômica da config no agente (tmp+rename): reinstalar por cima de um
+  agente funcional não destrói mais a configuração em caso de falha (ROO-649).
+
 ### Release 1.2.2 (ROO-590)
 
 1. No monorepo `rook-system`, rode o workflow **Build NFC-e Agent binaries** (gera
