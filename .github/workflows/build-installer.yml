@@ -91,6 +91,64 @@ jobs:
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\rook-agent-setup.iss"
 
+      # ACEITE ROO-509 — o instalador TEM que deixar o agente em execução.
+      # Era o sintoma do João: instala, tela de sucesso e nada no Gerenciador de
+      # Tarefas. O [Run] estava gated em `Check: ShouldRunAgentNow` → ConfigOk,
+      # mas o Inno processa as entradas [Run] ANTES de CurStepChanged(ssPostInstall),
+      # onde ConfigOk vira True — o Check era sempre False e o agente só subia no
+      # próximo logon (pelo VBS). Este passo instala de verdade num Windows real e
+      # falha se nenhum processo estiver de pé ao fim da instalação.
+      #
+      # Config é pré-criada para cair no caminho "manter configuração" (KeepConfig),
+      # que dispensa token real; o agente com token inválido apenas loga o 401 e
+      # segue vivo (src/index.ts:583-589), então o teste é estável.
+      - name: Aceite ROO-509 — instalador deixa o agente rodando (Windows real)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $appDir = Join-Path $env:LOCALAPPDATA 'Rook Agent'
+          $xmlDir = Join-Path $env:TEMP 'xmls-ci-roo509'
+          New-Item -ItemType Directory -Force -Path $appDir, $xmlDir | Out-Null
+
+          # Config prévia → PrevConfigExists=True → KeepConfig=True em modo silencioso
+          $cfg = @{ token = 'rk_agent_ci_roo509'; folder = $xmlDir } | ConvertTo-Json -Compress
+          [System.IO.File]::WriteAllText((Join-Path $appDir '.rook-agent.json'), $cfg, (New-Object System.Text.UTF8Encoding($false)))
+
+          # Terreno limpo: nenhum agente de execução anterior
+          Get-Process rook-agent -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 1
+          if (Get-Process rook-agent -ErrorAction SilentlyContinue) { throw 'Ambiente sujo: rook-agent ainda em execução antes do teste' }
+
+          Write-Host 'Instalando em modo silencioso...'
+          $p = Start-Process -FilePath 'installer\Output\RookAgentSetup.exe' `
+                 -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+          Write-Host "Instalador saiu com código $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "Instalador falhou (exit $($p.ExitCode))" }
+
+          # O agente sobe escondido e em background: dá tempo de arrancar
+          $agent = $null
+          foreach ($i in 1..15) {
+            Start-Sleep -Seconds 2
+            $agent = Get-Process rook-agent -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($agent) { break }
+          }
+
+          if (-not $agent) {
+            Write-Host '--- log do agente (se houver) ---'
+            $log = Join-Path $appDir 'rook-agent.log'
+            if (Test-Path $log) { Get-Content $log -Tail 30 } else { Write-Host '(sem log)' }
+            throw 'REGRESSAO ROO-509: a instalacao terminou e NENHUM rook-agent.exe esta em execucao. O usuario ve "concluido" e nada no Gerenciador de Tarefas.'
+          }
+
+          Write-Host "OK: rook-agent.exe em execucao (PID $($agent.Id)) logo apos a instalacao."
+
+          # Autostart também tem que existir (garante o agente no próximo logon)
+          $vbs = Join-Path ([Environment]::GetFolderPath('Startup')) 'Rook Agent.vbs'
+          if (-not (Test-Path $vbs)) { throw 'Autostart (Rook Agent.vbs) nao foi criado na pasta Startup' }
+          Write-Host 'OK: autostart registrado no Startup.'
+
+          Stop-Process -Id $agent.Id -Force -ErrorAction SilentlyContinue
+
       # Assinatura do instalador via eSigner (nuvem). CodeSignTool fixado em
       # v1.3.2 com SHA-256 conferido; jar invocado direto (o .bat exige o JDK
       # do zip de 214 MB e o .sh não põe aspas nos argumentos).
