@@ -1,0 +1,116 @@
+name: Sign release assets (Windows)
+
+# Assina o rook-agent-win.exe JÁ PUBLICADO num release deste repositório e o
+# sobe de volta (--clobber), usando o certificado Code Signing OV da Rook
+# System via eSigner/CodeSignTool.
+#
+# POR QUE AQUI (e não só no monorepo): o job publish do build-nfce-agent
+# (rook-system) precisa de um token com escrita NESTE repo — o
+# NFCE_AGENT_RELEASES_TOKEN nunca foi criado, então o upload de lá falha com
+# 403. Dentro deste repositório o github.token já tem contents:write, então
+# este workflow assina sem depender de PAT.
+#
+# Idempotente: se o asset já estiver assinado pela Rook System, não reassina.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag do release cujos assets serão assinados'
+        required: true
+        default: 'nfce-agent-v1.2.3'
+      force:
+        description: 'Reassinar mesmo se já houver assinatura válida'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    runs-on: windows-latest
+    steps:
+      - name: Baixar rook-agent-win.exe do release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release download "${{ inputs.release_tag }}" -R "${{ github.repository }}" -p "rook-agent-win.exe" -D in
+          $f = Get-Item in/rook-agent-win.exe
+          Write-Host "Baixado: $($f.Name) — $($f.Length) bytes"
+
+      - name: Estado atual da assinatura
+        id: current
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature in/rook-agent-win.exe
+          $isSigned = ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.Subject -match 'Rook System')
+          Write-Host "Status atual: $($sig.Status) — $($sig.SignerCertificate.Subject)"
+          "signed=$($isSigned.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Nada a fazer (já assinado)
+        if: steps.current.outputs.signed == 'true' && inputs.force != true
+        shell: pwsh
+        run: Write-Host 'Asset já assinado pela Rook System — nada a fazer (use force=true para reassinar).'
+
+      # CodeSignTool v1.3.2 fixado com SHA-256 conferido: se o zip for trocado
+      # no caminho, o passo falha em vez de executar código adulterado. O jar é
+      # invocado direto (o .bat oficial exige o JDK do zip de 214 MB).
+      - name: Assinar via eSigner (CodeSignTool)
+        if: steps.current.outputs.signed != 'true' || inputs.force == true
+        shell: pwsh
+        env:
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+          ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+          ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:ES_USERNAME -or -not $env:ES_PASSWORD -or -not $env:ES_TOTP_SECRET) {
+            throw "Secrets ES_USERNAME/ES_PASSWORD/ES_TOTP_SECRET ausentes (org secrets)."
+          }
+          curl.exe -fsSL -o codesigntool.zip https://github.com/SSLcom/CodeSignTool/releases/download/v1.3.2/CodeSignTool-v1.3.2.zip
+          $hash = (Get-FileHash codesigntool.zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne 'f14b1e1ef14bfa1fd00279c363aab0debbf5dcfba0e4bcdce5d22bb771de0e3a') {
+            throw "SHA-256 do CodeSignTool não confere: $hash"
+          }
+          Expand-Archive codesigntool.zip -DestinationPath cst -Force
+          $env:JAVA_HOME = $env:JAVA_HOME_17_X64
+          $env:Path = "$env:JAVA_HOME\bin;$env:Path"
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Set-Location cst
+          & java -jar jar\code_sign_tool-1.3.2.jar sign `
+            "-username=$env:ES_USERNAME" `
+            "-password=$env:ES_PASSWORD" `
+            "-totp_secret=$env:ES_TOTP_SECRET" `
+            "-input_file_path=$env:GITHUB_WORKSPACE\in\rook-agent-win.exe" `
+            "-output_dir_path=$env:GITHUB_WORKSPACE\out"
+          if ($LASTEXITCODE -ne 0) { throw "CodeSignTool falhou ($LASTEXITCODE)" }
+          Set-Location $env:GITHUB_WORKSPACE
+          if (-not (Test-Path out/rook-agent-win.exe)) { throw "arquivo assinado não foi gerado" }
+
+      - name: Verificar assinatura e integridade
+        if: steps.current.outputs.signed != 'true' || inputs.force == true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sig = Get-AuthenticodeSignature out/rook-agent-win.exe
+          Write-Host "Status: $($sig.Status)"
+          Write-Host "Signer: $($sig.SignerCertificate.Subject)"
+          Write-Host "Timestamp: $($sig.TimeStamperCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "Assinatura INVÁLIDA: $($sig.Status) — $($sig.StatusMessage)" }
+          if ($sig.SignerCertificate.Subject -notmatch 'Rook System') { throw "Assinante inesperado" }
+          # Assinar não pode corromper o binário: o agente tem que responder --version
+          $v = (& out/rook-agent-win.exe --version) | Out-String
+          Write-Host "Binário respondeu: $($v.Trim())"
+          if ($LASTEXITCODE -ne 0) { throw "--version falhou pós-assinatura" }
+
+      - name: Subir asset assinado de volta ao release
+        if: steps.current.outputs.signed != 'true' || inputs.force == true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release upload "${{ inputs.release_tag }}" out/rook-agent-win.exe -R "${{ github.repository }}" --clobber
+          Write-Host "rook-agent-win.exe ASSINADO publicado em ${{ inputs.release_tag }}."
