@@ -63,10 +63,18 @@ Name: "brazilianportuguese"; MessagesFile: "compiler:Languages\BrazilianPortugue
 [Files]
 Source: "rook-agent.exe"; DestDir: "{app}"; DestName: "{#ExeName}"; Flags: ignoreversion
 
-[Run]
-; Inicia o agente escondido ao finalizar (sem janela de console).
-; Check: só quando a configuração foi gravada (ou mantida) com sucesso.
-Filename: "{app}\{#ExeName}"; Flags: nowait runhidden skipifsilent; Check: ShouldRunAgentNow
+; SEM seção [Run] — de propósito (ROO-509).
+;
+; O agente é iniciado por StartAgentNow(), dentro do ssPostInstall. Havia aqui
+; um `Filename: {app}\{#ExeName}; Check: ShouldRunAgentNow`, e o Check devolvia
+; ConfigOk — que só vira True dentro de WriteConfigAndAutostart(), chamada no
+; ssPostInstall. Como o Inno processa as entradas [Run] ANTES de disparar o
+; ssPostInstall, o Check era SEMPRE avaliado com ConfigOk=False: o agente nunca
+; subia ao terminar a instalação (só no logon seguinte, pelo VBS). Somado ao
+; taskkill do PrepareToInstall, atualizar por cima deixava a máquina SEM agente.
+; `skipifsilent` ainda impedia o start em instalação silenciosa (deploy em rede).
+;
+; NÃO reintroduza [Run] com Check dependente de estado do ssPostInstall.
 
 [Code]
 var
@@ -78,6 +86,8 @@ var
   ConfigOk: Boolean;
   CheckOk: Boolean;
   CheckResultMsg: String;
+  // ROO-509: o agente ficou mesmo de pé ao terminar a instalação?
+  AgentStarted: Boolean;
 
 function ConfigFilePath(): String;
 begin
@@ -125,6 +135,7 @@ begin
   ConfigOk := False;
   CheckOk := False;
   CheckResultMsg := '';
+  AgentStarted := False;
 
   // Página de reinstalação: só aparece quando já existe config na máquina.
   ReinstallPage := CreateInputOptionPage(wpWelcome,
@@ -242,10 +253,37 @@ begin
   Result := '"' + S + StringOfChar('\', N) + '"';
 end;
 
-// Gate do [Run]: iniciar o agente só faz sentido com config gravada/mantida.
-function ShouldRunAgentNow(): Boolean;
+// ROO-509: inicia o agente AO FINAL da instalação, já no ssPostInstall —
+// depois de a config estar gravada (ConfigOk) e o autostart registrado.
+//
+// Aqui (e não no [Run]) porque o Inno avalia o Check das entradas [Run] antes
+// do ssPostInstall, quando ConfigOk ainda é False. ewNoWait: o instalador não
+// espera o daemon (que roda para sempre); SW_HIDE: sem janela de console.
+// Vale também para instalação silenciosa — deploy em rede precisa do agente
+// de pé sem ninguém deslogar.
+procedure StartAgentNow();
+var
+  exePath: String;
+  rc: Integer;
 begin
-  Result := ConfigOk;
+  if not ConfigOk then
+    Exit;
+
+  exePath := ExpandConstant('{app}') + '\{#ExeName}';
+  rc := 0;
+  if not Exec(exePath, '', ExpandConstant('{app}'), SW_HIDE, ewNoWait, rc) then
+  begin
+    // Não derruba a instalação: a config está gravada e o autostart registrado,
+    // então o agente sobe no próximo logon. Mas avisa em vez de falhar calado
+    // (o usuário precisa saber por que "não apareceu nada" agora).
+    AgentStarted := False;
+    SuppressibleMsgBox('A instalação foi concluída, mas o agente não pôde ser iniciado agora ' +
+      '(erro do Windows ' + IntToStr(rc) + ') — provável bloqueio do antivírus. ' +
+      'Ele será iniciado automaticamente no próximo login; para começar já, ' +
+      'reinicie o computador.', mbInformation, MB_OK, IDOK);
+  end
+  else
+    AgentStarted := True;
 end;
 
 // Grava a config DELEGANDO ao próprio agente (ROO-648) + registra a
@@ -280,15 +318,17 @@ begin
     if not Exec(exePath, params, appDir, SW_HIDE, ewWaitUntilTerminated, rc) then
     begin
       ConfigOk := False;
-      MsgBox('O executável do agente não pôde ser INICIADO (erro do Windows ' + IntToStr(rc) + '). ' +
+      // Suppressible (ROO-509): não congelar instalação silenciosa.
+      SuppressibleMsgBox('O executável do agente não pôde ser INICIADO (erro do Windows ' + IntToStr(rc) + '). ' +
         'Provável bloqueio do antivírus — restaure o rook-agent.exe na quarentena (Windows Defender → ' +
-        'Histórico de proteção) e rode o instalador novamente.', mbError, MB_OK);
+        'Histórico de proteção) e rode o instalador novamente.', mbError, MB_OK, IDOK);
     end
     else if rc <> 0 then
     begin
       ConfigOk := False;
-      MsgBox('O agente recusou a configuração (código ' + IntToStr(rc) + '). ' +
-        'Detalhes: %LOCALAPPDATA%\Rook Agent\rook-agent.log. Corrija a causa e rode o instalador novamente.', mbError, MB_OK);
+      // Suppressible (ROO-509): não congelar instalação silenciosa.
+      SuppressibleMsgBox('O agente recusou a configuração (código ' + IntToStr(rc) + '). ' +
+        'Detalhes: %LOCALAPPDATA%\Rook Agent\rook-agent.log. Corrija a causa e rode o instalador novamente.', mbError, MB_OK, IDOK);
     end;
   end;
 
@@ -479,6 +519,9 @@ begin
   begin
     WriteConfigAndAutostart();
     RunPostInstallCheck();
+    // ROO-509: por último — com config gravada, autostart registrado e o
+    // --check já concluído, o agente sobe e fica.
+    StartAgentNow();
   end;
 end;
 
@@ -491,9 +534,14 @@ begin
     WizardForm.FinishedLabel.Caption :=
       WizardForm.FinishedLabel.Caption + #13#10#13#10 + CheckResultMsg;
     if not CheckOk then
-      MsgBox('Atenção: o agente foi instalado, mas ainda NÃO está operando.' + #13#10#13#10 +
+      // SuppressibleMsgBox (ROO-509): MsgBox comum NÃO é suprimida por
+      // /SUPPRESSMSGBOXES — só a variante Suppressible é. Com MsgBox comum, uma
+      // instalação silenciosa (deploy em rede) CONGELAVA aqui para sempre
+      // esperando um clique que ninguém daria. Provado no CI: o instalador ficou
+      // preso 2min nesta caixa até o timeout do aceite matá-lo.
+      SuppressibleMsgBox('Atenção: o agente foi instalado, mas ainda NÃO está operando.' + #13#10#13#10 +
         CheckResultMsg + #13#10#13#10 +
-        'Log detalhado: %LOCALAPPDATA%\Rook Agent\rook-agent.log', mbError, MB_OK);
+        'Log detalhado: %LOCALAPPDATA%\Rook Agent\rook-agent.log', mbError, MB_OK, IDOK);
   end;
 end;
 
