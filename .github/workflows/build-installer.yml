@@ -37,6 +37,10 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    # Rede de segurança: passo travado não pendura o CI por horas (o padrão do
+    # GitHub é 6h). O caminho completo — download, compilação, aceite ROO-509 e
+    # assinatura — leva poucos minutos.
+    timeout-minutes: 25
     permissions:
       # write só é exercido no passo de anexar (dispatch); PRs não chegam lá
       contents: write
@@ -119,10 +123,24 @@ jobs:
           Start-Sleep -Seconds 1
           if (Get-Process rook-agent -ErrorAction SilentlyContinue) { throw 'Ambiente sujo: rook-agent ainda em execução antes do teste' }
 
+          # Timeout defensivo: instalador que trava não pode pendurar o CI por
+          # horas (foi o que aconteceu na 1ª execução deste aceite). /LOG guarda
+          # o diário do Inno para diagnóstico quando algo dá errado.
+          $instLog = Join-Path $env:TEMP 'inno-install.log'
           Write-Host 'Instalando em modo silencioso...'
           $p = Start-Process -FilePath 'installer\Output\RookAgentSetup.exe' `
-                 -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+                 -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$instLog" -PassThru
+          if (-not $p.WaitForExit(180000)) {
+            Write-Host '--- instalador nao terminou em 3 min: log do Inno ---'
+            if (Test-Path $instLog) { Get-Content $instLog -Tail 60 }
+            try { $p.Kill() } catch {}
+            throw 'Instalador TRAVOU (nao terminou em 3 minutos).'
+          }
           Write-Host "Instalador saiu com código $($p.ExitCode)"
+          if (Test-Path $instLog) {
+            Write-Host '--- ultimas linhas do log do Inno ---'
+            Get-Content $instLog -Tail 25
+          }
           if ($p.ExitCode -ne 0) { throw "Instalador falhou (exit $($p.ExitCode))" }
 
           # O agente sobe escondido e em background: dá tempo de arrancar
