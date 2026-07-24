@@ -1,9 +1,15 @@
 name: Build Installer (Windows)
 
 # Compila o instalador gráfico do Agente de Captação (Inno Setup) num runner
-# Windows e sobe o RookAgentSetup.exe como artefato. Não assina (a assinatura
-# de código é trilha paralela — certificado do PO). Roda no PR (para provar que
-# compila) e sob demanda.
+# Windows e sobe o RookAgentSetup.exe como artefato.
+#
+# CODE SIGNING (certificado OV SSL.com da Rook System, jul/2026): em
+# workflow_dispatch o instalador é ASSINADO via eSigner/CodeSignTool e, se
+# attach_to_release=true, anexado ao release. Antes de compilar, um gate
+# exige que o rook-agent-win.exe baixado JÁ esteja assinado — instalador
+# assinado não pode embalar agente sem assinatura (o auto-update entrega o
+# binário cru). Builds de PR/push só provam que compila: não assinam e não
+# tocam nos secrets ES_*.
 on:
   push:
     branches: ['**']
@@ -20,6 +26,10 @@ on:
         description: 'Release que contém o rook-agent-win.exe'
         required: true
         default: 'nfce-agent-v1.2.3'
+      attach_to_release:
+        description: 'Anexar o RookAgentSetup.exe assinado ao release'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -27,6 +37,9 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      # write só é exercido no passo de anexar (dispatch); PRs não chegam lá
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,6 +70,19 @@ jobs:
             throw "Binário baixado NÃO é v$appVersion — tag errada ou release desatualizado. Abortando para não embalar instalador $appVersion com agente antigo."
           }
 
+      # Gate de assinatura: no fluxo de release, o agente embalado precisa
+      # estar assinado (senão o SmartScreen volta a gritar no auto-update).
+      # Publique primeiro pelo build-nfce-agent do monorepo (que assina).
+      - name: Gate — agente embalado precisa estar assinado (dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature installer/rook-agent.exe
+          Write-Host "Agente: $($sig.Status) — $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Rook System') {
+            throw "rook-agent-win.exe do release NÃO está assinado pela Rook System. Rode antes o publish do build-nfce-agent (monorepo), que assina e sobe o binário."
+          }
+
       - name: Instalar o Inno Setup
         run: choco install innosetup --no-progress -y
 
@@ -64,6 +90,68 @@ jobs:
         shell: pwsh
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\rook-agent-setup.iss"
+
+      # Assinatura do instalador via eSigner (nuvem). CodeSignTool fixado em
+      # v1.3.2 com SHA-256 conferido; jar invocado direto (o .bat exige o JDK
+      # do zip de 214 MB e o .sh não põe aspas nos argumentos).
+      - name: Assinar RookAgentSetup.exe (eSigner CodeSignTool)
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+          ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+          ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:ES_USERNAME -or -not $env:ES_PASSWORD -or -not $env:ES_TOTP_SECRET) {
+            throw "Secrets ES_USERNAME/ES_PASSWORD/ES_TOTP_SECRET ausentes (org secrets)."
+          }
+          curl.exe -fsSL -o codesigntool.zip https://github.com/SSLcom/CodeSignTool/releases/download/v1.3.2/CodeSignTool-v1.3.2.zip
+          $hash = (Get-FileHash codesigntool.zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne 'f14b1e1ef14bfa1fd00279c363aab0debbf5dcfba0e4bcdce5d22bb771de0e3a') {
+            throw "SHA-256 do CodeSignTool não confere: $hash"
+          }
+          Expand-Archive codesigntool.zip -DestinationPath cst -Force
+          $env:JAVA_HOME = $env:JAVA_HOME_17_X64
+          $env:Path = "$env:JAVA_HOME\bin;$env:Path"
+          New-Item -ItemType Directory -Force -Path signed | Out-Null
+          Set-Location cst
+          & java -jar jar\code_sign_tool-1.3.2.jar sign `
+            "-username=$env:ES_USERNAME" `
+            "-password=$env:ES_PASSWORD" `
+            "-totp_secret=$env:ES_TOTP_SECRET" `
+            "-input_file_path=$env:GITHUB_WORKSPACE\installer\Output\RookAgentSetup.exe" `
+            "-output_dir_path=$env:GITHUB_WORKSPACE\signed"
+          if ($LASTEXITCODE -ne 0) { throw "CodeSignTool falhou ($LASTEXITCODE)" }
+          Set-Location $env:GITHUB_WORKSPACE
+          if (-not (Test-Path signed/RookAgentSetup.exe)) { throw "arquivo assinado não foi gerado" }
+          Move-Item -Force signed/RookAgentSetup.exe installer/Output/RookAgentSetup.exe
+
+      - name: Verificar Authenticode do instalador
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature installer/Output/RookAgentSetup.exe
+          Write-Host "Status: $($sig.Status)"
+          Write-Host "Signer: $($sig.SignerCertificate.Subject)"
+          Write-Host "Timestamp: $($sig.TimeStamperCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') {
+            throw "Assinatura INVÁLIDA: $($sig.Status) — $($sig.StatusMessage)"
+          }
+          if ($sig.SignerCertificate.Subject -notmatch 'Rook System') {
+            throw "Assinante inesperado: $($sig.SignerCertificate.Subject)"
+          }
+          Write-Host 'ASSINATURA DO INSTALADOR OK.'
+
+      - name: Anexar ao release
+        if: github.event_name == 'workflow_dispatch' && inputs.attach_to_release == true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.event.inputs.release_tag }}"
+          gh release upload $tag installer/Output/RookAgentSetup.exe -R "${{ github.repository }}" --clobber
+          Write-Host "RookAgentSetup.exe assinado anexado ao release $tag."
 
       - name: Publicar o artefato
         uses: actions/upload-artifact@v4
